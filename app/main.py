@@ -1,6 +1,6 @@
 """FastAPI 应用入口。
 
-启动时（lifespan）自动完成数据库初始化；接口：
+启动时（lifespan）自动完成数据库初始化与可重复迁移（摘要列补列与回填）；接口：
     POST /digests                          提交序列与酶列表，执行酶切并保存，返回完整结果
     GET  /digests                          列出全部提交的摘要
     GET  /digests/{id}                     按 id 查询保存的完整酶切结果

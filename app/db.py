@@ -1,8 +1,10 @@
 """SQLite 持久化层。
 
 数据库文件路径由环境变量 DATABASE_PATH 指定（默认 data/digest.db），
-应用启动时自动创建目录与表结构。所有写入在单个事务中完成，
-任一失败即整体回滚，不会产生半截数据。
+应用启动时自动创建目录与表结构，并对已有数据库执行可重复迁移：
+为 results 表补充 cut_count / fragment_count 摘要列并回填历史记录，
+使 GET /digests 列表只读摘要列，成本不随完整结果体积增长。
+所有写入在单个事务中完成，任一失败即整体回滚，不会产生半截数据。
 """
 
 from __future__ import annotations
@@ -54,9 +56,40 @@ class Database:
     def _init_schema(self) -> None:
         with self._connect() as conn:
             conn.executescript(SCHEMA)
+            self._migrate(conn)
+
+    @staticmethod
+    def _migrate(conn: sqlite3.Connection) -> None:
+        """可重复执行的迁移：为 results 表补充摘要列并回填历史记录。
+
+        列已存在时跳过 ALTER；仅回填摘要列仍为 NULL 的行，因此重复
+        启动无副作用，全新数据库与历史数据库收敛到同一结构。
+        """
+        columns = {
+            row["name"] for row in conn.execute("PRAGMA table_info(results)")
+        }
+        if "cut_count" not in columns:
+            conn.execute("ALTER TABLE results ADD COLUMN cut_count INTEGER")
+        if "fragment_count" not in columns:
+            conn.execute("ALTER TABLE results ADD COLUMN fragment_count INTEGER")
+        pending = conn.execute(
+            "SELECT submission_id, result_json FROM results"
+            " WHERE cut_count IS NULL OR fragment_count IS NULL"
+        ).fetchall()
+        for row in pending:
+            result = json.loads(row["result_json"])
+            conn.execute(
+                "UPDATE results SET cut_count = ?, fragment_count = ?"
+                " WHERE submission_id = ?",
+                (
+                    len(result["cuts"]),
+                    len(result["fragments"]),
+                    row["submission_id"],
+                ),
+            )
 
     def save_submission(self, sequence: str, topology: str, enzymes, result: dict):
-        """在一次事务中保存提交、酶列表与计算结果，返回 (id, created_at)。"""
+        """在一次事务中保存提交、酶列表、摘要计数与完整结果，返回 (id, created_at)。"""
         created_at = datetime.now(timezone.utc).isoformat()
         with self._connect() as conn:  # 异常时自动回滚
             cur = conn.execute(
@@ -73,8 +106,14 @@ class Database:
                 ],
             )
             conn.execute(
-                "INSERT INTO results (submission_id, result_json) VALUES (?, ?)",
-                (submission_id, json.dumps(result, ensure_ascii=False)),
+                "INSERT INTO results (submission_id, result_json, cut_count, fragment_count)"
+                " VALUES (?, ?, ?, ?)",
+                (
+                    submission_id,
+                    json.dumps(result, ensure_ascii=False),
+                    len(result["cuts"]),
+                    len(result["fragments"]),
+                ),
             )
         return submission_id, created_at
 
@@ -106,27 +145,29 @@ class Database:
         }
 
     def list_submissions(self) -> list[dict]:
-        """列出全部提交的摘要信息，按 id 升序（结果顺序确定）。"""
+        """列出全部提交的摘要信息，按 id 升序（结果顺序确定）。
+
+        只读取摘要列（cut_count / fragment_count 为持久化列），
+        不加载也不解析完整结果 JSON，列表成本不随结果体积增长。
+        """
         with self._connect() as conn:
             subs = conn.execute(
-                "SELECT s.id, s.sequence, s.topology, s.created_at,"
+                "SELECT s.id, s.topology, s.created_at,"
+                "       LENGTH(s.sequence) AS sequence_length,"
                 "       (SELECT COUNT(*) FROM enzymes e WHERE e.submission_id = s.id) AS enzyme_count,"
-                "       r.result_json AS result_json"
+                "       r.cut_count AS cut_count, r.fragment_count AS fragment_count"
                 " FROM submissions s JOIN results r ON r.submission_id = s.id"
                 " ORDER BY s.id"
             ).fetchall()
-        summaries = []
-        for row in subs:
-            result = json.loads(row["result_json"])
-            summaries.append(
-                {
-                    "id": row["id"],
-                    "topology": row["topology"],
-                    "sequence_length": len(row["sequence"]),
-                    "enzyme_count": row["enzyme_count"],
-                    "cut_count": len(result["cuts"]),
-                    "fragment_count": len(result["fragments"]),
-                    "created_at": row["created_at"],
-                }
-            )
-        return summaries
+        return [
+            {
+                "id": row["id"],
+                "topology": row["topology"],
+                "sequence_length": row["sequence_length"],
+                "enzyme_count": row["enzyme_count"],
+                "cut_count": row["cut_count"],
+                "fragment_count": row["fragment_count"],
+                "created_at": row["created_at"],
+            }
+            for row in subs
+        ]

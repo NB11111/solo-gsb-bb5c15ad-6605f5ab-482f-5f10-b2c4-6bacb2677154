@@ -7,14 +7,15 @@
 
 ## 快速启动
 
-一条指令完成构建、依赖安装与数据库初始化：
+一条指令完成构建、依赖安装、数据库初始化与迁移：
 
 ```bash
 docker compose up --build
 ```
 
 依赖在镜像构建时安装（`pip install -r requirements.txt`），SQLite 数据库在容器
-启动时自动建库建表，无需任何手工步骤。服务监听容器内 **8000** 端口，compose 通过
+启动时自动建库建表并执行[可重复迁移](#存储与迁移)（为历史库补充摘要列并回填），
+无需任何手工步骤。服务监听容器内 **8000** 端口，compose 通过
 `ports: ["8000:8000"]` 映射到宿主机同一端口——启动后直接访问
 **http://localhost:8000/docs** 即可看到包含全部接口的交互式文档（如宿主机 8000
 端口被占用，可把 compose 中映射改为 `8001:8000` 后从 8001 访问）。
@@ -53,6 +54,19 @@ pip install -r requirements.txt
 uvicorn app.main:app --host 0.0.0.0 --port 8000
 ```
 
+## 存储与迁移
+
+- 每条提交的完整酶切结果以 JSON 保存在 `results` 表；`cut_count` /
+  `fragment_count` 作为**摘要列**持久化在同一张表中。
+- **新提交在同一事务**写入提交、酶列表、摘要计数与完整结果，任一失败整体回滚。
+- **启动时自动执行可重复迁移**：检测 `results` 表是否缺少摘要列，缺失则
+  `ALTER TABLE` 补列，并从已保存的 `result_json` 回填全部历史记录的摘要计数。
+  迁移是幂等的——重复启动（无论全新库还是历史库）都收敛到同一结构，不会产生
+  副作用；`docker compose up --build` 一条命令即完成建库与迁移。
+- `GET /digests` 列表**只查询摘要列**（含 `LENGTH(sequence)` 与酶计数），不再
+  加载、解析完整结果 JSON，因此列表成本不随历史记录的结果体积增长；响应字段
+  与按 id 升序的行为保持不变。
+
 ## API 地址
 
 - 服务地址：**http://localhost:8000**
@@ -64,7 +78,7 @@ uvicorn app.main:app --host 0.0.0.0 --port 8000
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | `POST` | `/digests` | 提交序列与酶列表，执行酶切、保存并返回完整结果（201） |
-| `GET` | `/digests` | 列出全部提交的摘要（按 id 升序） |
+| `GET` | `/digests` | 列出全部提交的摘要（按 id 升序，只读摘要列） |
 | `GET` | `/digests/{id}` | 按 id 查询保存的完整酶切结果（不存在返回 404） |
 | `POST` | `/digests/{id}/variant-analysis` | 对已保存记录施加一组单碱基替换并重跑酶切，返回切口与片段长度差异（不落库，记录不存在返回 404） |
 | `POST` | `/digests/{id}/enzyme-panel-plan` | 枚举候选酶组合，寻找达到目标片段数的最少酶集合（只读不落库，记录不存在返回 404，无解返回 422） |
@@ -1178,10 +1192,11 @@ app/
 ├── identification.py # 未知样本识别（观测/预期片段一对一最优配对、字典序择优、命中/歧义判定）
 ├── iupac.py     # IUPAC 编码表与反向互补
 ├── schemas.py   # 请求/响应模型与校验
-└── db.py        # SQLite 持久化（启动时自动建表）
+└── db.py        # SQLite 持久化（启动时自动建表与摘要列迁移）
 tests/
 ├── test_digest.py       # 酶切算法测试
 ├── test_api.py          # 提交/查询/校验 API 测试
+├── test_db_migration.py # 摘要列迁移与回填测试
 ├── test_variant_api.py  # 变异影响分析 API 测试
 ├── test_panel_api.py    # 酶组合面板规划 API 测试
 ├── test_distribution_api.py  # 部分酶切概率分布 API 测试
