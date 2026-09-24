@@ -19,6 +19,18 @@ docker compose up --build
 **http://localhost:8000/docs** 即可看到包含全部接口的交互式文档（如宿主机 8000
 端口被占用，可把 compose 中映射改为 `8001:8000` 后从 8001 访问）。
 
+### 自动迁移（升级旧数据库）
+
+容器启动（应用 lifespan 初始化）时除建表外，还会对**已有的旧版 SQLite 库自动执行
+可重复迁移**：为 `results` 表补齐摘要列 `cut_count`（切口数）与
+`fragment_count`（片段数），并从每条历史记录保存的完整结果 `result_json` 中
+回填这两个计数值。迁移是**幂等**的——列已存在则跳过，已回填的行不会被重复更新，
+因此反复启动、重复运行都安全；建库、补列与回填在同一事务内完成，中途失败整体回滚，
+不会产生半截数据。迁移后 `GET /digests` 列表只查询摘要列，不再逐条加载、解析完整
+酶切结果，历史记录增多时列表成本不再随结果体积增长；新提交的摘要计数与完整结果在
+同一事务写入。无需手工执行任何迁移命令，`docker compose up --build` 一条指令即
+完成建库与迁移。
+
 其它常用 Docker 操作：
 
 ```bash
@@ -42,7 +54,7 @@ docker run --rm digest-api sh -c "pip install --no-cache-dir pytest httpx && pyt
 
 | 配置项 | 默认值 | 说明 |
 | --- | --- | --- |
-| 环境变量 `DATABASE_PATH` | `/app/data/digest.db`（容器内） | SQLite 数据库文件路径，目录不存在时自动创建 |
+| 环境变量 `DATABASE_PATH` | `/app/data/digest.db`（容器内） | SQLite 数据库文件路径，目录不存在时自动创建；启动时自动建表并对旧库执行幂等迁移回填 |
 | 端口映射 | `8000:8000`（compose 中 `ports`） | 宿主机端口：容器端口 |
 | 数据卷 | `digest-data` → `/app/data` | 持久化数据库文件 |
 
@@ -1178,7 +1190,7 @@ app/
 ├── identification.py # 未知样本识别（观测/预期片段一对一最优配对、字典序择优、命中/歧义判定）
 ├── iupac.py     # IUPAC 编码表与反向互补
 ├── schemas.py   # 请求/响应模型与校验
-└── db.py        # SQLite 持久化（启动时自动建表）
+└── db.py        # SQLite 持久化（启动时自动建表；旧版库可重复迁移并回填 cut_count / fragment_count 摘要列）
 tests/
 ├── test_digest.py       # 酶切算法测试
 ├── test_api.py          # 提交/查询/校验 API 测试
